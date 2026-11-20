@@ -1,16 +1,37 @@
 """SOCKS5-клиент без зависимостей + пул проверенных RU-прокси."""
 from __future__ import annotations
-import ipaddress, json, random, re, socket, struct, threading, time
+
+import ipaddress
+import json
+import os
+import random
+import re
+import socket
+import struct
+import threading
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-PROXY_SOURCES = [
+DEFAULT_SOURCES = ",".join([
+    # только RU-списки
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/RU/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/proxies/countries/RU/socks5.txt",
+    "https://www.proxy-list.download/api/v1/get?type=socks5&country=RU",
+    # общие списки: оттуда выживут только те, у кого реальный exit == RU
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-]
-IP_RE = re.compile(r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})(?![\d])")
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+])
+PROXY_SOURCES = [s.strip() for s in os.getenv("RU_PROXY_SOURCES", DEFAULT_SOURCES).split(",") if s.strip()]
+
+UA = "ru-proxy-radar/1.0"
+GEO_URL = "http://ip-api.com/json/?fields=status,countryCode,query"
+
+IP_PORT = re.compile(r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})(?![\d])")
+AUTH_IP_PORT = re.compile(r"([^\s:@/]+):([^\s:@/]+)@((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})")
 
 
 class SocksError(Exception):
@@ -103,7 +124,7 @@ def http_get_via(p: Proxy, url: str, timeout: float = 10.0) -> str:
     try:
         s.sendall(
             f"GET {path} HTTP/1.1\r\nHost: {u.hostname}\r\n"
-            f"User-Agent: ru-proxy-radar\r\nConnection: close\r\n\r\n".encode()
+            f"User-Agent: {UA}\r\nConnection: close\r\n\r\n".encode()
         )
         data = b""
         while len(data) < 65536:
@@ -119,21 +140,60 @@ def http_get_via(p: Proxy, url: str, timeout: float = 10.0) -> str:
         s.close()
 
 
-def load_candidates(sources=PROXY_SOURCES, limit: int = 4000) -> list[Proxy]:
-    import urllib.request
+def _from_json(text: str) -> list[tuple[str, int]]:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        ip = it.get("ip") or it.get("host")
+        port = it.get("port")
+        if ip and port:
+            try:
+                out.append((str(ip).strip(), int(port)))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _parse(text: str) -> list[tuple[str, int, str | None, str | None]]:
+    """ip:port | user:pass@ip:port | JSON со списком."""
+    found: list[tuple[str, int, str | None, str | None]] = []
+    for user, pw, host, port in AUTH_IP_PORT.findall(text):
+        found.append((host, int(port), user, pw))
+    for host, port in IP_PORT.findall(text):
+        found.append((host, int(port), None, None))
+    for host, port in _from_json(text):
+        found.append((host, port, None, None))
+    return [f for f in found if 0 < f[1] < 65536]
+
+
+def load_candidates(sources=None, limit: int = 4000) -> list[Proxy]:
+    sources = sources or PROXY_SOURCES
     out, seen = [], set()
     for url in sources:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ru-proxy-radar/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 text = r.read(8 << 20).decode("utf-8", "ignore")
-        except Exception:
+        except Exception as e:
+            print(f"[pool] источник недоступен: {url} ({e})")
             continue
-        for host, port in IP_RE.findall(text):
-            key = (host, int(port))
-            if key not in seen and 0 < int(port) < 65536:
-                seen.add(key)
-                out.append(Proxy(host, int(port)))
+        got = 0
+        for host, port, user, pw in _parse(text):
+            key = (host, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(Proxy(host, port, user, pw))
+            got += 1
+        print(f"[pool] {got:5d} из {url}")
         if len(out) >= limit:
             break
     return out[:limit]
@@ -143,7 +203,7 @@ def validate(proxies: list[Proxy], workers: int = 64, timeout: float = 8.0) -> l
     """Оставляем только те, у кого реальный exit-country == RU."""
     def one(p: Proxy) -> Proxy | None:
         try:
-            body = http_get_via(p, "http://ip-api.com/json/?fields=status,countryCode,query", timeout)
+            body = http_get_via(p, GEO_URL, timeout)
             j = json.loads(body[body.find("{"):body.rfind("}") + 1])
             if j.get("status") == "success":
                 p.country = j.get("countryCode") or "??"
@@ -154,8 +214,14 @@ def validate(proxies: list[Proxy], workers: int = 64, timeout: float = 8.0) -> l
             pass
         return None
 
+    good = []
     with ThreadPoolExecutor(workers) as ex:
-        return [p for p in ex.map(one, proxies) if p]
+        for i, p in enumerate(ex.map(one, proxies), 1):
+            if p:
+                good.append(p)
+            if i % 500 == 0:
+                print(f"[pool] проверено {i}/{len(proxies)}, RU: {len(good)}")
+    return good
 
 
 class RuPool:
