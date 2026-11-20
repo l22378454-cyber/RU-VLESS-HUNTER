@@ -44,16 +44,10 @@ jobs:
       - name: Установить xray-knife
         run: |
           set -euo pipefail
-          api=https://api.github.com/repos/lilendian0x00/xray-knife/releases/latest
-          url=$(curl -fsSL "$api" \
-            | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 \
-            | grep -Ei 'linux-(64|amd64|x86_64).*\.zip$' | head -1)
-          test -n "$url" || { echo "не нашёл linux-ассет в релизе"; exit 1; }
-          echo "asset: $url"
-          curl -fsSL -o /tmp/xk.zip "$url"
+          curl -fsSL -o /tmp/xk.zip \
+            https://github.com/lilendian0x00/xray-knife/releases/latest/download/Xray-knife-linux-64.zip
           unzip -oq /tmp/xk.zip -d /tmp/xk
-          bin=$(find /tmp/xk -type f -name 'xray-knife*' ! -name '*.json' ! -name '*.md' | head -1)
-          chmod +x "$bin"
+          bin=$(find /tmp/xk -type f -name 'xray-knife*' | head -1)
           sudo install -m755 "$bin" /usr/local/bin/xray-knife
           xray-knife -V
 
