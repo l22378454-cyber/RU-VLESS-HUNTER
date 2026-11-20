@@ -1,0 +1,114 @@
+name: radar
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"        # каждые 4 часа, UTC
+  workflow_dispatch:
+    inputs:
+      skip_knife:
+        description: "Пропустить стадию xray-knife"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  GIT_TERMINAL_PROMPT: "0"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Кеш данных (гео + пул прокси)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/geo_cache.json
+            data/ru_pool.json
+          key: radar-data-${{ github.run_id }}
+          restore-keys: radar-data-
+
+      - name: Установить xray-knife
+        run: |
+          set -euo pipefail
+          api=https://api.github.com/repos/lilendian0x00/xray-knife/releases/latest
+          url=$(curl -fsSL "$api" \
+            | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 \
+            | grep -Ei 'linux-(64|amd64|x86_64).*\.zip$' | head -1)
+          test -n "$url" || { echo "не нашёл linux-ассет в релизе"; exit 1; }
+          echo "asset: $url"
+          curl -fsSL -o /tmp/xk.zip "$url"
+          unzip -oq /tmp/xk.zip -d /tmp/xk
+          bin=$(find /tmp/xk -type f -name 'xray-knife*' ! -name '*.json' ! -name '*.md' | head -1)
+          chmod +x "$bin"
+          sudo install -m755 "$bin" /usr/local/bin/xray-knife
+          xray-knife -V
+
+      - name: 1/5 collect
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m ruradar collect
+
+      - name: 2/5 geo
+        run: python -m ruradar geo
+
+      - name: 3/5 pool
+        run: python -m ruradar pool
+
+      - name: 4/5 tcp через RU-прокси
+        timeout-minutes: 40
+        run: python -m ruradar tcp
+
+      - name: 5/5 xray-knife
+        if: ${{ !inputs.skip_knife }}
+        env:
+          RU_EGRESS_PROXY: ${{ secrets.RU_EGRESS_PROXY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RU_EGRESS_PROXY:-}" ]; then
+            echo "::add-mask::$RU_EGRESS_PROXY"
+            echo "egress: через RU-прокси"
+            sudo -E bash scripts/ru-egress.sh "$RU_EGRESS_PROXY" -- \
+              python -m ruradar knife
+          else
+            echo "::warning::RU_EGRESS_PROXY не задан — кнайф меряет с раннера (US)"
+            python -m ruradar knife
+          fi
+
+      - name: Итог в Summary
+        if: always()
+        run: |
+          {
+            echo "### radar"
+            for f in TCP_config.txt Knife_config.txt; do
+              n=$(grep -c '://' "$f" 2>/dev/null || echo 0)
+              echo "- \`$f\`: **$n**"
+            done
+            echo "- пул RU-прокси: $(python -c "import json;print(len(json.load(open('data/ru_pool.json'))))" 2>/dev/null || echo '—')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit & push
+        run: |
+          set -euo pipefail
+          git config user.name  "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add -A TCP_config.txt Knife_config.txt
+          if git diff --cached --quiet; then
+            echo "изменений нет — коммит не нужен"
+            exit 0
+          fi
+          git commit -m "chore: radar refresh $(date -u +%FT%TZ)"
+          git push
