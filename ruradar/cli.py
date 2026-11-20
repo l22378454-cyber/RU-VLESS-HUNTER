@@ -12,10 +12,12 @@ def _read_nodes() -> list[links.Node]:
     return [links.Node(**n) for n in raw]
 
 
+from dataclasses import asdict
+
+
 def _save_nodes(nodes, name="nodes.json"):
     DATA.mkdir(exist_ok=True)
-    (DATA / name).write_text(json.dumps([n.__dict__ for n in nodes], ensure_ascii=False, indent=0))
-
+    (DATA / name).write_text(json.dumps([asdict(n) for n in nodes], ensure_ascii=False, indent=0))
 
 def cmd_collect(a):
     specs = [l.strip() for l in Path(a.sources).read_text().splitlines()
