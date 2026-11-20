@@ -1,6 +1,7 @@
-"""SOCKS5-клиент без зависимостей + пул проверенных RU-прокси."""
+"""SOCKS5 + HTTP CONNECT клиент без зависимостей + пул проверенных RU-прокси."""
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
@@ -11,17 +12,14 @@ import struct
 import threading
 import time
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 DEFAULT_SOURCES = ",".join([
-    # только RU-списки
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/RU/data.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/proxies/countries/RU/socks5.txt",
-    "https://www.proxy-list.download/api/v1/get?type=socks5&country=RU",
-    # общие списки: оттуда выживут только те, у кого реальный exit == RU
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
 ])
@@ -49,6 +47,7 @@ def _recv(s, n: int) -> bytes:
 
 
 def handshake(s, host: str, port: int, auth=None) -> None:
+    """SOCKS5 CONNECT."""
     s.sendall(b"\x05\x02\x00\x02" if auth else b"\x05\x01\x00")
     ver, method = _recv(s, 2)
     if ver != 5:
@@ -82,6 +81,24 @@ def handshake(s, host: str, port: int, auth=None) -> None:
         _recv(s, _recv(s, 1)[0] + 2)
 
 
+def _http_connect(s, host: str, port: int, auth=None) -> None:
+    """HTTP CONNECT."""
+    hdr = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+    if auth:
+        hdr += "Proxy-Authorization: Basic " + base64.b64encode(b":".join(auth)).decode() + "\r\n"
+    s.sendall((hdr + "\r\n").encode())
+    line = b""
+    while not line.endswith(b"\r\n\r\n"):
+        c = s.recv(1)
+        if not c:
+            raise SocksError("eof")
+        line += c
+        if len(line) > 8192:
+            raise SocksError("header too long")
+    if b" 200 " not in line.split(b"\r\n")[0]:
+        raise SocksError(line[:60].decode("latin1", "ignore"))
+
+
 @dataclass
 class Proxy:
     host: str
@@ -94,6 +111,7 @@ class Proxy:
     fails: int = 0
     cooldown: float = 0.0
     inflight: int = 0
+    proto: str = "socks5"          # socks5 | http
 
     @property
     def auth(self):
@@ -102,15 +120,19 @@ class Proxy:
     @property
     def url(self) -> str:
         cred = f"{self.user}:{self.pw}@" if self.user else ""
-        return f"socks5://{cred}{self.host}:{self.port}"
+        return f"{self.proto}://{cred}{self.host}:{self.port}"
 
 
 def open_tunnel(p: Proxy, host: str, port: int, timeout: float = 8.0):
+    """Открыть TCP-туннель через прокси. Возвращает (socket, latency)."""
     t0 = time.monotonic()
     s = socket.create_connection((p.host, p.port), timeout)
     s.settimeout(timeout)
     try:
-        handshake(s, host, port, p.auth)
+        if p.proto == "http":
+            _http_connect(s, host, port, p.auth)
+        else:
+            handshake(s, host, port, p.auth)
     except Exception:
         s.close()
         raise
@@ -166,9 +188,15 @@ def _parse(text: str) -> list[tuple[str, int, str | None, str | None]]:
     """ip:port | user:pass@ip:port | JSON со списком."""
     found: list[tuple[str, int, str | None, str | None]] = []
     for user, pw, host, port in AUTH_IP_PORT.findall(text):
-        found.append((host, int(port), user, pw))
+        try:
+            found.append((host, int(port), user, pw))
+        except ValueError:
+            pass
     for host, port in IP_PORT.findall(text):
-        found.append((host, int(port), None, None))
+        try:
+            found.append((host, int(port), None, None))
+        except ValueError:
+            pass
     for host, port in _from_json(text):
         found.append((host, port, None, None))
     return [f for f in found if 0 < f[1] < 65536]
@@ -199,28 +227,49 @@ def load_candidates(sources=None, limit: int = 4000) -> list[Proxy]:
     return out[:limit]
 
 
-def validate(proxies: list[Proxy], workers: int = 64, timeout: float = 8.0) -> list[Proxy]:
-    """Оставляем только те, у кого реальный exit-country == RU."""
+def validate(proxies: list[Proxy], workers: int = 128, timeout: float = 6.0) -> list[Proxy]:
+    """Оставляем только те, у кого реальный exit-country == RU. Протокол определяется на ходу."""
+    countries: Counter[str] = Counter()
+    by_proto: Counter[str] = Counter()
+    good: list[Proxy] = []
+
     def one(p: Proxy) -> Proxy | None:
-        try:
-            body = http_get_via(p, GEO_URL, timeout)
-            j = json.loads(body[body.find("{"):body.rfind("}") + 1])
-            if j.get("status") == "success":
-                p.country = j.get("countryCode") or "??"
-                if p.country == "RU":
-                    p.latency = 1.0
-                    return p
-        except Exception:
-            pass
+        protos = ("socks5", "http") if p.proto == "socks5" else (p.proto,)
+        for proto in protos:
+            p.proto = proto
+            try:
+                body = http_get_via(p, GEO_URL, timeout)
+            except Exception:
+                continue
+            i, j = body.find("{"), body.rfind("}")
+            if i < 0:
+                continue
+            try:
+                d = json.loads(body[i:j + 1])
+            except Exception:
+                continue
+            if d.get("status") != "success":
+                continue
+            cc = (d.get("countryCode") or "??").upper()
+            countries[cc] += 1
+            by_proto[f"{proto}:{cc}"] += 1
+            if cc == "RU":
+                p.country = "RU"
+                p.latency = 1.0
+                return p
+            return None
         return None
 
-    good = []
     with ThreadPoolExecutor(workers) as ex:
         for i, p in enumerate(ex.map(one, proxies), 1):
             if p:
                 good.append(p)
             if i % 500 == 0:
                 print(f"[pool] проверено {i}/{len(proxies)}, RU: {len(good)}")
+
+    print("[pool] страны:", dict(countries.most_common(12)))
+    print("[pool] протоколы:", dict(by_proto.most_common(12)))
+    print(f"[pool] ответили: {sum(countries.values())} / {len(proxies)}, RU: {len(good)}")
     return good
 
 
